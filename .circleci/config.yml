@@ -2,7 +2,122 @@ version: 2
 jobs:
   build:
     docker:
-      - image: ruby:2.3.3
+      - image: discourse/discourse_test:1.3.10
+      - image: postgres:9.5.5
+      - image: redis:3.0.6
+    working_directory: ~/discourse
+    environment:
+      # This affects gems installed
+      - RAILS_MASTER: 0
+      - DISCOURSE_HOSTNAME: www.example.com
+      - RUBY_GC_MALLOC_LIMIT: 50000000
+    parallelism: 4
     steps:
       - checkout
+      - run:
+          name: clone discourse dependency repos
+          command: |
+            git clone --depth=1 https://github.com/discourse/discourse-backup-uploads-to-s3.git plugins/discourse-backup-uploads-to-s3
+            git clone --depth=1 https://github.com/discourse/discourse-spoiler-alert.git plugins/discourse-spoiler-alert
+            git clone --depth=1 https://github.com/discourse/discourse-cakeday.git plugins/discourse-cakeday
+            git clone --depth=1 https://github.com/discourse/discourse-canned-replies.git plugins/discourse-canned-replies
+
+      #- run:
+          #name: install npm global tools
+          #command: |
+            #sudo npm install --global eslint babel-eslint
+
+      - run:
+          name: Debug
+          command: |
+            echo $PATH
+            ls -la /usr/local/bin
+
+      - run:
+          name: eslint assets
+          command: |
+            #export PATH=~/yarn_global/bin:$PATH
+            eslint app/assets/javascripts
+            eslint --ext .es6 app/assets/javascripts
+            eslint --ext .es6 test/javascripts
+            eslint --ext .es6 plugins/**/assets/javascripts
+            eslint test/javascripts
+
+      #- run:
+          #name: Inject RspecJunitFormatter to Gemfile
+          #command: |
+            #echo '
+             #gem "rspec_junit_formatter"
+             #' >> Gemfile
+
+      - restore_cache:
+          keys:
+            - discourse-bundler-v1-{{ .Branch }}-{{ checksum "Gemfile.lock" }}
+            - discourse-bundler-v1-{{ .Branch }}-
+            - discourse-bundler-v1-
+
+      # From travis.yml: only take RAILS_MASTER=0 code path. Current Discourse
+      # Gemfile.lock pins rails to 4.x and the other code path tries to install
+      # Rails 5.x and fails.
+      - run:
+          name: Install Bundler dependencies
+          command: |
+            bundle install --without development \
+                           --deployment \
+                           --retry=3 \
+                           --jobs=3
+
+      - save_cache:
+          key: discourse-bundler-v1-{{ .Branch }}-{{ checksum "Gemfile.lock" }}
+          paths:
+            # the --deployment flag tells bundler to install here
+            - vendor/bundle
+
+      - run:
+          name: Set up database
+          environment:
+            - RAILS_ENV: test
+          command: |
+            sudo echo '
+            127.0.0.1 test.localhost
+            ' >> /etc/hosts
+            echo 'test:
+              adapter: postgresql
+              database: discourse_test
+              username: postgres
+              host: test.localhost
+            ' > config/database.yml
+
+            bundle exec rake db:create db:migrate
+
+      - run:
+          name: Run tests
+          environment:
+            - RAILS_ENV: test
+            - RACK_ENV: test
+          command: |
+            circleci tests glob \
+                  "spec/**/*_spec.rb" > /tmp/rspec_files
+
+            TEST_FILES=$(circleci tests split --split-by=timings \
+              --timings-type=filename < /tmp/rspec_files )
+
+            echo "splitting " $(cat /tmp/rspec_files | wc -w) " total test files"
+            echo "running " $(echo $TEST_FILES | wc -w) " test files on this container"
+
+            mkdir -p /tmp/rspec
+
+            #bundle exec rspec --format RspecJunitFormatter \
+                              #--out /tmp/rspec/rspec.xml \
+            bundle exec rspec --profile -- \
+                              $TEST_FILES
+
+            bundle exec rake plugin:spec
+            bundle exec rake qunit:test['200000']
+
+      - store_test_results:
+          path: /tmp/rspec
+
+      - store_artifacts:
+          path: /tmp/rspec
 
